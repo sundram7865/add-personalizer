@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from app.models.schemas import (
-    AnalyzeAdRequest, AnalyzeAdResponse,
+    AnalyzeAdRequest, AnalyzeAdResponse, PersonalizeFullRequest, PersonalizeFullResponse,
     ScrapePageRequest, ScrapePageResponse,
     PersonalizeRequest, PersonalizeResponse,
 )
@@ -43,3 +43,23 @@ def personalize_route(body: PersonalizeRequest) -> PersonalizeResponse:
         landing_page_url=body.landing_page_url,
     )
     return PersonalizeResponse(success=True, personalized_page=personalized)
+
+@router.post("/personalize-full", response_model=PersonalizeFullResponse)
+def personalize_full_route(body: PersonalizeFullRequest) -> PersonalizeFullResponse:
+    """
+    Unified endpoint: chains all 3 layers.
+    Frontend only needs to call this one.
+    """
+    ad_signals = analyze_ad(body.ad_image_url)
+    page_elements = scrape_page(body.landing_page_url)
+    personalized = personalize_page(
+        ad_signals=ad_signals,
+        page_elements=page_elements,
+        landing_page_url=body.landing_page_url,
+    )
+    return PersonalizeFullResponse(
+        success=True,
+        ad_signals=ad_signals,
+        page_elements=page_elements,
+        personalized_page=personalized,
+    )

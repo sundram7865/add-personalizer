@@ -86,3 +86,13 @@ class PersonalizeResponse(BaseModel):
 class ErrorResponse(BaseModel):
     success: bool = False
     error: str
+    
+class PersonalizeFullRequest(BaseModel):
+    ad_image_url: str
+    landing_page_url: str
+
+class PersonalizeFullResponse(BaseModel):
+    success: bool
+    ad_signals: AdSignals
+    page_elements: PageElements
+    personalized_page: PersonalizedPage
