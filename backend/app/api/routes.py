@@ -1,3 +1,4 @@
+from fastapi.responses import HTMLResponse
 from fastapi import APIRouter
 from app.models.schemas import (
     AnalyzeAdRequest, AnalyzeAdResponse, PersonalizeFullRequest, PersonalizeFullResponse,
@@ -57,9 +58,24 @@ def personalize_full_route(body: PersonalizeFullRequest) -> PersonalizeFullRespo
         page_elements=page_elements,
         landing_page_url=body.landing_page_url,
     )
+    try:
+        with open("preview.html", "w", encoding="utf-8") as f:
+            f.write(personalized.modified_html)
+        print("✅ Saved! Check your project root folder for preview.html")
+    except Exception as e:
+        print(f"⚠️ Could not save preview.html: {e}")
+        
     return PersonalizeFullResponse(
         success=True,
         ad_signals=ad_signals,
         page_elements=page_elements,
         personalized_page=personalized,
     )
+    
+@router.get("/preview", response_class=HTMLResponse)
+def preview():
+    try:
+        with open("preview.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except:
+        return "No preview found"

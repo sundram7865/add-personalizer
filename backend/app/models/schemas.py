@@ -96,3 +96,4 @@ class PersonalizeFullResponse(BaseModel):
     ad_signals: AdSignals
     page_elements: PageElements
     personalized_page: PersonalizedPage
+    

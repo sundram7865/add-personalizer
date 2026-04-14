@@ -1,16 +1,17 @@
 import json
-import requests
-from bs4 import BeautifulSoup
-from app.core.claude_client import get_claude_client, CLAUDE_MODEL
+from playwright.sync_api import sync_playwright
+from urllib.parse import urlparse
+from app.core.gemini_client import get_gemini_model
 from app.models.schemas import AdSignals, PageElements, PersonalizedPage, ChangeItem
-from app.core.exceptions import PersonalizationError, InvalidURLError
+from app.core.exceptions import PersonalizationError
+
 
 SYSTEM_PROMPT = """You are a senior conversion rate optimization (CRO) specialist and copywriter.
 You personalize landing pages to match the tone, message, and audience of a specific ad creative.
 Your goal is message match — the visitor who clicked the ad should feel the page was made for them.
 Always respond with valid JSON only. No markdown, no explanation, just raw JSON."""
 
-# CRO principles to guide the model
+
 CRO_PRINCIPLES = [
     "Message Match: Mirror the exact language and promise from the ad",
     "Specificity: Use numbers, timeframes, and concrete details from the ad",
@@ -20,9 +21,10 @@ CRO_PRINCIPLES = [
     "Trust: Keep claims believable and grounded",
 ]
 
+
 PERSONALIZATION_PROMPT = """You are personalizing a landing page to match a specific ad creative.
 
-AD SIGNALS (what the user saw in the ad):
+AD SIGNALS:
 - Headline: {headline}
 - CTA Text: {cta_text}
 - Tone: {tone}
@@ -31,126 +33,113 @@ AD SIGNALS (what the user saw in the ad):
 - Emotional Hook: {emotional_hook}
 - Color Mood: {color_mood}
 
-CURRENT LANDING PAGE ELEMENTS:
+CURRENT LANDING PAGE:
 - Page Title: {page_title}
 - H1: {h1}
 - H2: {h2}
 - Hero Paragraph: {hero_paragraph}
 - CTA Button: {cta_button_text}
 
-CRO PRINCIPLES TO APPLY:
+CRO PRINCIPLES:
 {principles}
 
-TASK:
-Rewrite ONLY the elements that exist in the landing page (don't invent elements that aren't there).
-For each element you change, explain which CRO principle you applied and why.
-
-Return ONLY a valid JSON object with exactly this structure:
+Return ONLY valid JSON in this structure:
 {{
   "new_elements": {{
-    "h1": "rewritten h1 or null if not present",
-    "h2": "rewritten h2 or null if not present",
-    "hero_paragraph": "rewritten hero paragraph or null if not present",
-    "cta_button_text": "rewritten cta or null if not present",
-    "page_title": "rewritten page title or null if not present"
+    "h1": "...",
+    "h2": "...",
+    "hero_paragraph": "...",
+    "cta_button_text": "...",
+    "page_title": "..."
   }},
-  "changes": [
-    {{
-      "element": "H1 Headline",
-      "original": "the original text",
-      "updated": "the new text",
-      "cro_principle": "Message Match",
-      "reason": "one sentence explaining the specific change"
-    }}
-  ]
+  "changes": []
 }}
-
-Rules:
-- Only include elements that actually changed in the "changes" array
-- Keep the same general length as the original — don't make it much longer
-- Never fabricate facts. Build on what's already there
-- The tone must match: {tone}
-- The audience must feel seen: {target_audience}"""
+"""
 
 
-def _fetch_page_html(url: str) -> str:
-    """Fetch raw HTML of the landing page."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+def _fix_asset_paths(html: str, base_url: str) -> str:
+    parsed = urlparse(base_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    html = html.replace('src="/', f'src="{base}/')
+    html = html.replace('href="/', f'href="{base}/')
+
+    return html
+
+def personalize_with_dom(url: str, new_elements: PageElements) -> str:
+    """
+    Use Playwright to:
+    - Load REAL page (JS rendered)
+    - Modify DOM safely
+    - Return full working HTML
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto(url, wait_until="networkidle")
+
+        # ✅ Wait for React to fully render
+        page.wait_for_timeout(3000)  # important!
+
+        # ✅ Inject script that runs AFTER page loads
+        page.evaluate(
+            """(data) => {
+                setTimeout(() => {
+                    if (data.h1) {
+                        document.querySelectorAll('h1').forEach(el => el.innerText = data.h1);
+                    }
+
+                    if (data.h2) {
+                        document.querySelectorAll('h2').forEach(el => el.innerText = data.h2);
+                    }
+
+                    if (data.hero_paragraph) {
+                        document.querySelectorAll('p').forEach(el => {
+                            if (el.innerText.length > 40) {
+                                el.innerText = data.hero_paragraph;
+                            }
+                        });
+                    }
+
+                    if (data.cta_button_text) {
+                        document.querySelectorAll('button, a').forEach(el => {
+                            if (el.innerText.length < 40) {
+                                el.innerText = data.cta_button_text;
+                            }
+                        });
+                    }
+
+                    if (data.page_title) {
+                        document.title = data.page_title;
+                    }
+                }, 1000); // delay after React render
+            }""",
+            {
+                "h1": new_elements.h1,
+                "h2": new_elements.h2,
+                "hero_paragraph": new_elements.hero_paragraph,
+                "cta_button_text": new_elements.cta_button_text,
+                "page_title": new_elements.page_title,
+            },
         )
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        raise InvalidURLError(f"Could not re-fetch landing page for modification: {str(e)}")
 
+        # ✅ wait again so changes stick
+        page.wait_for_timeout(2000)
 
-def _inject_changes_into_html(
-    original_html: str,
-    page_elements: PageElements,
-    new_elements: PageElements,
-) -> str:
-    """
-    Surgically replace only the changed text nodes in the original HTML.
-    The page structure, styles, images — everything else stays intact.
-    """
-    try:
-        soup = BeautifulSoup(original_html, "lxml")
-    except Exception:
-        soup = BeautifulSoup(original_html, "html.parser")
+        html = page.content()
+        browser.close()
 
-    def replace_text(tag, original_text: str | None, new_text: str | None):
-        """Find a tag by its text content and replace it."""
-        if not original_text or not new_text or original_text == new_text:
-            return
-        found = soup.find(tag, string=lambda t: t and original_text.lower() in t.lower())
-        if found:
-            found.string = new_text
-
-    # Replace H1
-    replace_text("h1", page_elements.h1, new_elements.h1)
-
-    # Replace H2
-    replace_text("h2", page_elements.h2, new_elements.h2)
-
-    # Replace title tag
-    if page_elements.page_title and new_elements.page_title:
-        title_tag = soup.find("title")
-        if title_tag:
-            title_tag.string = new_elements.page_title
-
-    # Replace hero paragraph — find by partial match since paragraphs can be complex
-    if page_elements.hero_paragraph and new_elements.hero_paragraph:
-        for p in soup.find_all("p"):
-            if page_elements.hero_paragraph[:50].lower() in p.get_text().lower():
-                p.string = new_elements.hero_paragraph
-                break
-
-    # Replace CTA button text
-    if page_elements.cta_button_text and new_elements.cta_button_text:
-        for btn in soup.find_all(["button", "a"]):
-            if page_elements.cta_button_text.lower() in btn.get_text(strip=True).lower():
-                btn.string = new_elements.cta_button_text
-                break
-
-    return str(soup)
-
+        return html
 
 def personalize_page(
     ad_signals: AdSignals,
     page_elements: PageElements,
     landing_page_url: str,
 ) -> PersonalizedPage:
-    """
-    Layer 3: Use Claude to generate personalized copy based on ad signals.
-    Then inject changes into the real HTML. Returns PersonalizedPage.
-    """
-    client = get_claude_client()
+
+    model = get_gemini_model()
+
     principles_str = "\n".join(f"- {p}" for p in CRO_PRINCIPLES)
 
     prompt = PERSONALIZATION_PROMPT.format(
@@ -170,39 +159,35 @@ def personalize_page(
     )
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+        response = model.generate_content(
+            [SYSTEM_PROMPT, prompt],
+            generation_config={"response_mime_type": "application/json"},
         )
     except Exception as e:
-        raise PersonalizationError(f"Claude API error: {str(e)}")
+        raise PersonalizationError(f"Gemini API error: {str(e)}")
 
-    raw_text = response.content[0].text.strip()
-
-    # Strip accidental markdown fences
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("```")[1]
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-        raw_text = raw_text.strip()
+    raw_text = response.text.strip()
 
     try:
         data = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        raise PersonalizationError(f"Could not parse Claude's response as JSON: {str(e)}")
+    except Exception as e:
+        raise PersonalizationError(f"Invalid JSON from Gemini: {str(e)}")
 
-    # Parse new_elements and changes
     try:
         new_elements = PageElements(**data["new_elements"])
-        changes = [ChangeItem(**c) for c in data.get("changes", [])]
+        changes = []
+        
+        for c in data.get("changes", []):
+           if isinstance(c, dict):
+                changes.append(ChangeItem(**c))
     except Exception as e:
         raise PersonalizationError(f"Response structure invalid: {str(e)}")
 
-    # Fetch original HTML and inject changes
-    original_html = _fetch_page_html(landing_page_url)
-    modified_html = _inject_changes_into_html(original_html, page_elements, new_elements)
+    # ✅ REAL FIX → render + modify DOM
+    modified_html = personalize_with_dom(landing_page_url, new_elements)
+
+    # ✅ Fix assets so preview works
+    modified_html = _fix_asset_paths(modified_html, landing_page_url)
 
     return PersonalizedPage(
         modified_html=modified_html,

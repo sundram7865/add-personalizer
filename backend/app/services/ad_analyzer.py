@@ -1,7 +1,7 @@
 import json
 import httpx
 import base64
-from app.core.claude_client import get_claude_client, CLAUDE_MODEL
+from app.core.gemini_client import get_gemini_model
 from app.models.schemas import AdSignals
 from app.core.exceptions import AdAnalysisError, InvalidURLError
 
@@ -9,24 +9,29 @@ SYSTEM_PROMPT = """You are an expert advertising analyst and conversion rate opt
 You will analyze ad creatives and extract structured signals for landing page personalization.
 Always respond with valid JSON only. No markdown, no explanation, just raw JSON."""
 
-ANALYSIS_PROMPT = """Analyze this ad creative image carefully and extract the following signals.
+ANALYSIS_PROMPT = """Analyze this ad creative image carefully.
+
+IMPORTANT:
+- Read ALL visible text (headlines, buttons, captions, small text)
+- Pay attention to colors, layout, and emotional cues
+
 Return ONLY a valid JSON object with exactly these fields:
 
 {
   "headline": "the main headline or key message of the ad",
   "cta_text": "the call-to-action text (e.g. 'Get Started Free', 'Shop Now')",
   "tone": "the emotional tone (e.g. 'urgent', 'friendly', 'professional', 'playful', 'luxury')",
-  "target_audience": "who this ad targets (e.g. 'budget-conscious homeowners', 'startup founders')",
+  "target_audience": "who this ad targets",
   "value_proposition": "the core benefit or promise being made",
-  "emotional_hook": "the emotional trigger being used (e.g. 'fear of missing out', 'aspiration', 'trust')",
-  "color_mood": "describe the visual mood from colors (e.g. 'warm and energetic', 'calm and professional')"
+  "emotional_hook": "the emotional trigger being used",
+  "color_mood": "describe the visual mood from colors"
 }
 
-Be specific and concise. Each value should be 3-15 words maximum."""
+Each value should be 3-15 words maximum.
+"""
 
 
 def _fetch_image_as_base64(image_url: str) -> tuple[str, str]:
-    """Download the image and return (base64_data, media_type)."""
     try:
         response = httpx.get(image_url, timeout=15, follow_redirects=True)
         response.raise_for_status()
@@ -36,7 +41,7 @@ def _fetch_image_as_base64(image_url: str) -> tuple[str, str]:
         raise InvalidURLError(f"Could not reach ad image URL: {str(e)}")
 
     content_type = response.headers.get("content-type", "image/jpeg")
-    # Normalize content type
+
     if "png" in content_type:
         media_type = "image/png"
     elif "gif" in content_type:
@@ -46,57 +51,41 @@ def _fetch_image_as_base64(image_url: str) -> tuple[str, str]:
     else:
         media_type = "image/jpeg"
 
-    image_data = base64.standard_b64encode(response.content).decode("utf-8")
+    image_data = base64.b64encode(response.content).decode("utf-8")
     return image_data, media_type
 
 
 def analyze_ad(ad_image_url: str) -> AdSignals:
-    """
-    Layer 1: Send the ad image to Claude Vision and extract structured signals.
-    Returns an AdSignals object.
-    """
     image_data, media_type = _fetch_image_as_base64(ad_image_url)
-    client = get_claude_client()
+
+    model = get_gemini_model()
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=512,
-            system=SYSTEM_PROMPT,
-            messages=[
+        response = model.generate_content(
+            [
+                SYSTEM_PROMPT,
+                ANALYSIS_PROMPT,
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": ANALYSIS_PROMPT,
-                        },
-                    ],
-                }
+                    "mime_type": media_type,
+                    "data": image_data,
+                },
             ],
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.2,  # ✅ more consistent JSON
+            },
         )
     except Exception as e:
-        raise AdAnalysisError(f"Claude Vision API error: {str(e)}")
+        raise AdAnalysisError(f"Gemini Vision API error: {str(e)}")
 
-    raw_text = response.content[0].text.strip()
+    # ✅ SAFETY: Gemini can sometimes return None
+    if not response or not response.text:
+        raise AdAnalysisError("Empty response from Gemini Vision")
 
-    # Strip accidental markdown fences if present
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("```")[1]
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-        raw_text = raw_text.strip()
+    raw_text = response.text.strip()
 
     try:
         data = json.loads(raw_text)
         return AdSignals(**data)
-    except (json.JSONDecodeError, Exception) as e:
-        raise AdAnalysisError(f"Could not parse Claude's response as JSON: {str(e)}")
+    except Exception as e:
+        raise AdAnalysisError(f"Invalid JSON from Gemini: {str(e)} | Raw: {raw_text}")
